@@ -1,17 +1,17 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 #[allow(dead_code, unused_imports, unused_variables)]
+mod detect;
+#[allow(dead_code, unused_imports, unused_variables)]
 mod error;
 #[allow(dead_code, unused_imports, unused_variables)]
 mod types;
-#[allow(dead_code, unused_imports, unused_variables)]
-mod detect;
 #[allow(dead_code, unused_imports, unused_variables)]
 mod wipe;
 
 use chrono::{Local, TimeZone};
 use iced::widget::{
-    Space, button, column, container, pick_list, progress_bar, row, scrollable, text, text_input,
+    Space, button, column, container, progress_bar, row, scrollable, text, text_input,
 };
 use iced::{Element, Length, Settings, Subscription, Task, application, time, window};
 use iced_aw::{style, widget::Card};
@@ -34,11 +34,11 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "windows")]
+use types::{DeviceInfo as AlgoDeviceInfo, DeviceType as AlgoDeviceType};
 use types::{
     ProgressInfo as AlgoProgressInfo, WipeMethod, WipeResult as AlgoWipeResult, WipeStandard,
 };
-#[cfg(target_os = "windows")]
-use types::{DeviceInfo as AlgoDeviceInfo, DeviceType as AlgoDeviceType};
 use wipe::WipeEngine;
 
 const DEFAULT_VOLUME_LABEL: &str = "ChangeMe";
@@ -48,42 +48,6 @@ const DETAILS_SCROLLABLE_ID: &str = "details-scrollable";
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 const NATIVE_PROGRESS_UNKNOWN: u32 = u32::MAX;
-
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsbWipeOption {
-    OnePass,
-    Dod3Pass,
-    Usaf7Pass,
-}
-
-impl UsbWipeOption {
-    const ALL: [UsbWipeOption; 3] = [
-        UsbWipeOption::OnePass,
-        UsbWipeOption::Dod3Pass,
-        UsbWipeOption::Usaf7Pass,
-    ];
-
-    fn standard(self) -> WipeStandard {
-        match self {
-            UsbWipeOption::OnePass => WipeStandard::Nist80088Clear,
-            UsbWipeOption::Dod3Pass => WipeStandard::DoD522022M,
-            UsbWipeOption::Usaf7Pass => WipeStandard::DoD522022MECE,
-        }
-    }
-
-}
-
-impl std::fmt::Display for UsbWipeOption {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            UsbWipeOption::OnePass => "1-pass",
-            UsbWipeOption::Dod3Pass => "DoD 3-pass",
-            UsbWipeOption::Usaf7Pass => "USAF 7-pass",
-        };
-        f.write_str(label)
-    }
-}
 
 fn main() -> iced::Result {
     match maybe_relaunch_with_elevation() {
@@ -300,7 +264,6 @@ struct WelcomeApp {
     persist_path: PathBuf,
     persisted: PersistedState,
     volume_label_input: String,
-    usb_wipe_option: UsbWipeOption,
     show_format_confirmation: bool,
     is_wiping: bool,
     wipe_progress: f32,
@@ -322,7 +285,6 @@ enum Message {
     SelectDrive(usize),
     ToggleBlockSelected,
     VolumeLabelChanged(String),
-    UsbWipeOptionSelected(UsbWipeOption),
     StartWipe,
     WipeProgressTick,
     WipeCompleted(Result<WipeExecution, String>),
@@ -358,7 +320,6 @@ fn boot() -> (WelcomeApp, Task<Message>) {
             persist_path,
             persisted: persisted.clone(),
             volume_label_input: sanitize_volume_label(&persisted.default_volume_label),
-            usb_wipe_option: UsbWipeOption::OnePass,
             show_format_confirmation: false,
             is_wiping: false,
             wipe_progress: 0.0,
@@ -435,15 +396,6 @@ fn update(state: &mut WelcomeApp, message: Message) -> Task<Message> {
             state.show_format_confirmation = false;
             Task::none()
         }
-        Message::UsbWipeOptionSelected(option) => {
-            if state.is_wiping || state.is_formatting {
-                return Task::none();
-            }
-            state.usb_wipe_option = option;
-            state.show_format_confirmation = false;
-            state.status_message = format!("USB wipe method set to {}.", option);
-            Task::none()
-        }
         Message::StartWipe => {
             if state.is_wiping || state.is_formatting {
                 return Task::none();
@@ -466,7 +418,7 @@ fn update(state: &mut WelcomeApp, message: Message) -> Task<Message> {
                 return Task::none();
             }
 
-            let selected_standard = selected_wipe_standard_for_drive(state, &drive);
+            let selected_standard = selected_wipe_standard_for_drive(&drive);
             let estimated_seconds = estimate_wipe_duration_seconds(&drive, &selected_standard);
             state.is_wiping = true;
             state.show_format_confirmation = false;
@@ -575,8 +527,7 @@ fn update(state: &mut WelcomeApp, message: Message) -> Task<Message> {
                             selected_path
                         );
                     } else {
-                        state.status_message =
-                            format!("Wipe finished for {}.", selected_path);
+                        state.status_message = format!("Wipe finished for {}.", selected_path);
                     }
 
                     let suggested_dir = state.persisted.last_log_dir.clone();
@@ -713,9 +664,7 @@ fn update(state: &mut WelcomeApp, message: Message) -> Task<Message> {
                 let format_info = FormatLogInfo {
                     partition_scheme: "GPT".to_string(),
                     filesystem: "exFAT".to_string(),
-                    volume_label: attempted_label
-                        .clone()
-                        .unwrap_or_else(|| "N/A".to_string()),
+                    volume_label: attempted_label.clone().unwrap_or_else(|| "N/A".to_string()),
                     status: format_status,
                     device_sha256,
                 };
@@ -736,7 +685,8 @@ fn update(state: &mut WelcomeApp, message: Message) -> Task<Message> {
                 }
             }
             if let Some(error) = log_update_warning {
-                state.status_message = format!("{} (log update warning: {error})", state.status_message);
+                state.status_message =
+                    format!("{} (log update warning: {error})", state.status_message);
             }
             Task::none()
         }
@@ -816,7 +766,11 @@ fn view(state: &WelcomeApp) -> Element<'_, Message> {
         .unwrap_or_else(|| "None".to_string());
 
     let summary_strip = row![
-        stat_pill("Detected", state.drives.len().to_string(), StatTone::Neutral),
+        stat_pill(
+            "Detected",
+            state.drives.len().to_string(),
+            StatTone::Neutral
+        ),
         stat_pill(
             "Blocked",
             state.blocked_device_ids.len().to_string(),
@@ -885,12 +839,14 @@ fn view(state: &WelcomeApp) -> Element<'_, Message> {
 
     let drives_panel = Card::new(
         text("Removable Devices").size(20),
-        scrollable(drive_list).width(Length::Fill).height(Length::Fill),
+        scrollable(drive_list)
+            .width(Length::Fill)
+            .height(Length::Fill),
     )
-        .style(neutral_card_header_style)
-        .padding(12.into())
-        .width(Length::FillPortion(2))
-        .height(Length::Fill);
+    .style(neutral_card_header_style)
+    .padding(12.into())
+    .width(Length::FillPortion(2))
+    .height(Length::Fill);
 
     let mut details_panel = column![].spacing(8).width(Length::Fill);
 
@@ -932,16 +888,8 @@ fn view(state: &WelcomeApp) -> Element<'_, Message> {
             if is_usb_drive(drive) {
                 details_panel = details_panel
                     .push(Space::new().height(8))
-                    .push(text("USB Wipe Method"))
-                    .push(
-                        pick_list(
-                            UsbWipeOption::ALL.as_slice(),
-                            Some(state.usb_wipe_option),
-                            Message::UsbWipeOptionSelected,
-                        )
-                        .placeholder("Choose wipe method")
-                        .width(Length::Fill),
-                    );
+                    .push(text("USB Wipe Profile"))
+                    .push(text("dc3dd, single pass, pattern 00"));
             }
 
             let can_wipe = can_start_wipe(state, drive);
@@ -1036,10 +984,10 @@ fn view(state: &WelcomeApp) -> Element<'_, Message> {
             .width(Length::Fill)
             .height(Length::Fill),
     )
-        .style(neutral_card_header_style)
-        .padding(12.into())
-        .width(Length::FillPortion(3))
-        .height(Length::Fill);
+    .style(neutral_card_header_style)
+    .padding(12.into())
+    .width(Length::FillPortion(3))
+    .height(Length::Fill);
 
     let body = row![drives_panel, details_container]
         .spacing(20)
@@ -1078,9 +1026,9 @@ fn can_start_wipe(state: &WelcomeApp, drive: &DriveInfo) -> bool {
     true
 }
 
-fn selected_wipe_standard_for_drive(state: &WelcomeApp, drive: &DriveInfo) -> WipeStandard {
+fn selected_wipe_standard_for_drive(drive: &DriveInfo) -> WipeStandard {
     if is_usb_drive(drive) {
-        state.usb_wipe_option.standard()
+        WipeStandard::Nist80088Clear
     } else {
         WipeStandard::Nist80088Purge
     }
@@ -1368,7 +1316,7 @@ fn build_wipe_log_text(
     lines.push(divider.to_string());
     lines.push(String::new());
     lines.push(format!(
-        "Manufacturer  : {}",
+        "Vendor        : {}",
         display_value_or_unknown(&drive.vendor)
     ));
     lines.push(format!(
@@ -1380,9 +1328,18 @@ fn build_wipe_log_text(
     lines.push("DEVICE INFORMATION".to_string());
     lines.push(section.to_string());
     lines.push(format!("Device Path   : {}", drive.device_path));
-    lines.push(format!("Model         : {}", display_value_or_unknown(&drive.model)));
-    lines.push(format!("Size          : {}", format_capacity(drive.capacity_bytes)));
-    lines.push(format!("Type          : {}", display_value_or_unknown(&drive.drive_type)));
+    lines.push(format!(
+        "Model         : {}",
+        display_value_or_unknown(&drive.model)
+    ));
+    lines.push(format!(
+        "Size          : {}",
+        format_capacity(drive.capacity_bytes)
+    ));
+    lines.push(format!(
+        "Type          : {}",
+        display_value_or_unknown(&drive.drive_type)
+    ));
     lines.push(format!(
         "Volume Label  : {}",
         display_value_or_unknown(&drive.volume_name)
@@ -1393,7 +1350,10 @@ fn build_wipe_log_text(
     lines.push(section.to_string());
     lines.push(format!("Wipe Standard : {}", execution.wipe_standard));
     lines.push(format!("Wipe Method   : {}", execution.wipe_method));
-    lines.push(format!("Total Passes  : {}", execution.passes_completed.max(1)));
+    lines.push(format!(
+        "Total Passes  : {}",
+        execution.passes_completed.max(1)
+    ));
     lines.push(format!(
         "Wipe Started  : {}",
         format_local_datetime(execution.started_unix)
@@ -1409,13 +1369,20 @@ fn build_wipe_log_text(
     ));
     lines.push(format!(
         "Wipe Status   : {}",
-        if execution.success { "SUCCESS" } else { "FAILED" }
+        if execution.success {
+            "SUCCESS"
+        } else {
+            "FAILED"
+        }
     ));
     lines.push(String::new());
     lines.push(section.to_string());
     lines.push("POST-WIPE FORMATTING".to_string());
     lines.push(section.to_string());
-    lines.push(format!("Partition Scheme : {}", format_info.partition_scheme));
+    lines.push(format!(
+        "Partition Scheme : {}",
+        format_info.partition_scheme
+    ));
     lines.push(format!("Filesystem       : {}", format_info.filesystem));
     lines.push(format!(
         "Volume Label     : {}",
@@ -1529,7 +1496,7 @@ fn run_preflight_checks() -> PreflightReport {
                 .push(format!("Automatic gdisk install attempt failed: {error}"));
         }
 
-        let required_tools = ["lsblk", "sgdisk", "mkfs.exfat", "partprobe"];
+        let required_tools = ["dc3dd", "lsblk", "sgdisk", "mkfs.exfat", "partprobe"];
         let missing: Vec<String> = required_tools
             .iter()
             .filter(|tool| !command_exists(tool))
@@ -1623,10 +1590,7 @@ fn run_linux_command_checked(program: &str, args: &[&str]) -> Result<(), String>
         format!("exit code {:?}", output.status.code())
     };
 
-    Err(format!(
-        "{program} {} failed: {detail}",
-        args.join(" ")
-    ))
+    Err(format!("{program} {} failed: {detail}", args.join(" ")))
 }
 
 #[cfg(target_os = "linux")]
@@ -1640,7 +1604,9 @@ fn ensure_linux_gdisk_installed() -> Result<(), String> {
     } else if command_exists("apt") {
         "apt"
     } else {
-        return Err("Neither apt-get nor apt was found for automatic gdisk installation.".to_string());
+        return Err(
+            "Neither apt-get nor apt was found for automatic gdisk installation.".to_string(),
+        );
     };
 
     if is_running_with_admin_privileges() {
@@ -1734,7 +1700,10 @@ async fn run_wipe_task(
         .map_err(|error| format!("Wipe worker join error: {error}"))?
 }
 
-async fn run_format_task(drive: DriveInfo, volume_label: String) -> Result<FormatTaskResult, String> {
+async fn run_format_task(
+    drive: DriveInfo,
+    volume_label: String,
+) -> Result<FormatTaskResult, String> {
     tokio::task::spawn_blocking(move || {
         let message = perform_format_sync(drive.clone(), &volume_label)?;
         let device_sha256 = match compute_device_sha256(&drive.device_path) {
@@ -1746,22 +1715,32 @@ async fn run_format_task(drive: DriveInfo, volume_label: String) -> Result<Forma
             device_sha256,
         })
     })
-        .await
-        .map_err(|error| format!("Format worker join error: {error}"))?
+    .await
+    .map_err(|error| format!("Format worker join error: {error}"))?
 }
 
-fn rewrite_wipe_log_with_format(saved_log: &SavedWipeLog, format_info: FormatLogInfo) -> Result<(), String> {
+fn rewrite_wipe_log_with_format(
+    saved_log: &SavedWipeLog,
+    format_info: FormatLogInfo,
+) -> Result<(), String> {
     let log_text = build_wipe_log_text(
         &saved_log.execution,
         &saved_log.path,
         Some(&format_info),
         unix_now(),
     );
-    fs::write(&saved_log.path, log_text)
-        .map_err(|error| format!("Failed updating wipe log {}: {error}", saved_log.path.to_string_lossy()))
+    fs::write(&saved_log.path, log_text).map_err(|error| {
+        format!(
+            "Failed updating wipe log {}: {error}",
+            saved_log.path.to_string_lossy()
+        )
+    })
 }
 
-async fn save_wipe_log(execution: WipeExecution, suggested_dir: Option<String>) -> Result<String, String> {
+async fn save_wipe_log(
+    execution: WipeExecution,
+    suggested_dir: Option<String>,
+) -> Result<String, String> {
     #[cfg(target_os = "windows")]
     {
         return save_wipe_log_windows(execution, suggested_dir).await;
@@ -1813,14 +1792,22 @@ async fn save_wipe_log_windows(
 fn save_wipe_log_linux(execution: WipeExecution) -> Result<String, String> {
     let timestamp = execution.ended_unix.max(unix_now());
     let output_dir = linux_default_log_dir();
-    fs::create_dir_all(&output_dir)
-        .map_err(|error| format!("Failed creating log directory {}: {error}", output_dir.to_string_lossy()))?;
+    fs::create_dir_all(&output_dir).map_err(|error| {
+        format!(
+            "Failed creating log directory {}: {error}",
+            output_dir.to_string_lossy()
+        )
+    })?;
     chown_path_to_linux_user(&output_dir)?;
 
     let output_path = output_dir.join(build_wipe_log_file_name(timestamp));
     let log_text = build_wipe_log_text(&execution, &output_path, None, unix_now());
-    fs::write(&output_path, log_text)
-        .map_err(|error| format!("Failed writing log file {}: {error}", output_path.to_string_lossy()))?;
+    fs::write(&output_path, log_text).map_err(|error| {
+        format!(
+            "Failed writing log file {}: {error}",
+            output_path.to_string_lossy()
+        )
+    })?;
     chown_path_to_linux_user(&output_path)?;
     Ok(output_path.to_string_lossy().to_string())
 }
@@ -1833,9 +1820,15 @@ fn chown_path_to_linux_user(path: &Path) -> Result<(), String> {
         .unwrap_or_else(|| "user".to_string());
 
     let status = Command::new("chown")
-        .args([&format!("{target_user}:{target_user}"), &path.to_string_lossy()])
+        .arg(format!("{target_user}:{target_user}"))
+        .arg(path)
         .status()
-        .map_err(|error| format!("Failed running chown for {}: {error}", path.to_string_lossy()))?;
+        .map_err(|error| {
+            format!(
+                "Failed running chown for {}: {error}",
+                path.to_string_lossy()
+            )
+        })?;
 
     if status.success() {
         Ok(())
@@ -1882,7 +1875,16 @@ fn perform_wipe_sync(
     standard: WipeStandard,
     native_progress: Option<Arc<AtomicU32>>,
 ) -> Result<WipeExecution, String> {
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
+    {
+        if is_usb_drive(&drive) {
+            return perform_linux_usb_wipe_with_dc3dd(drive, native_progress);
+        }
+
+        return perform_wipe_with_algorithm(drive, standard, native_progress);
+    }
+
+    #[cfg(target_os = "windows")]
     {
         return perform_wipe_with_algorithm(drive, standard, native_progress);
     }
@@ -1954,7 +1956,9 @@ fn perform_wipe_with_algorithm(
                 } else {
                     format!("exit code {:?}", record.exit_code)
                 };
-                return Err(format!("Failed to unmount {mount_point} before wipe: {detail}"));
+                return Err(format!(
+                    "Failed to unmount {mount_point} before wipe: {detail}"
+                ));
             }
         }
     }
@@ -1966,6 +1970,58 @@ fn perform_wipe_with_algorithm(
 
     let wipe_result = run_wipe_engine(&drive, standard, native_progress)?;
     Ok(convert_wipe_result_to_execution(drive, wipe_result))
+}
+
+#[cfg(target_os = "linux")]
+fn perform_linux_usb_wipe_with_dc3dd(
+    drive: DriveInfo,
+    native_progress: Option<Arc<AtomicU32>>,
+) -> Result<WipeExecution, String> {
+    let mount_points = list_linux_mount_points(&drive.device_path)?;
+    let mut commands = Vec::new();
+
+    for mount_point in mount_points {
+        let args = vec!["-f".to_string(), mount_point.clone()];
+        let record = run_command_record("umount", &args)?;
+        if !record.succeeded() {
+            let detail = command_record_error_detail(&record);
+            return Err(format!(
+                "Failed to unmount {mount_point} before wipe: {detail}"
+            ));
+        }
+        commands.push(record);
+    }
+
+    let started_unix = unix_now();
+    let dc3dd_args = vec![format!("wipe={}", drive.device_path), "pat=00".to_string()];
+    let record = run_command_record("dc3dd", &dc3dd_args)?;
+    let ended_unix = unix_now();
+
+    if let Some(tracker) = native_progress {
+        tracker.store(10_000, Ordering::Relaxed);
+    }
+
+    if !record.succeeded() {
+        let detail = command_record_error_detail(&record);
+        return Err(format!(
+            "dc3dd wipe failed for {}: {detail}",
+            drive.device_path
+        ));
+    }
+
+    commands.push(record);
+
+    Ok(WipeExecution {
+        drive,
+        wipe_standard: wipe_standard_label(&WipeStandard::Nist80088Clear),
+        wipe_method: "dc3dd pattern overwrite (1 pass, pat=00)".to_string(),
+        passes_completed: 1,
+        verified: false,
+        success: true,
+        started_unix,
+        ended_unix,
+        commands,
+    })
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -2040,8 +2096,9 @@ fn convert_wipe_result_to_execution(drive: DriveInfo, result: AlgoWipeResult) ->
     let result_json = result.to_json().unwrap_or_else(|error| {
         format!("{{\"error\":\"Failed serializing WipeResult: {error}\"}}")
     });
+    let requested_standard = wipe_standard_label(&result.standard_requested);
     let record = CommandRecord {
-        command: "wipe_algorithm::WipeEngine::wipe(Nist80088Purge)".to_string(),
+        command: format!("wipe_algorithm::WipeEngine::wipe({requested_standard})"),
         exit_code: Some(if result.success { 0 } else { 1 }),
         stdout: truncate_for_log(result_json),
         stderr: truncate_for_log(result.messages.join("\n")),
@@ -2091,9 +2148,8 @@ fn prepare_windows_disk_for_wipe(drive: &DriveInfo) -> Result<(), String> {
     let disk_number = extract_windows_disk_number(&drive.device_path)
         .ok_or_else(|| format!("Could not parse disk number from {}", drive.device_path))?;
 
-    let script = format!(
-        "select disk {disk_number}\nattributes disk clear readonly\nonline disk noerr\n"
-    );
+    let script =
+        format!("select disk {disk_number}\nattributes disk clear readonly\nonline disk noerr\n");
     let record = run_diskpart_script(&script, None)?;
     if !record.succeeded() {
         return Err(format!(
@@ -2106,7 +2162,6 @@ fn prepare_windows_disk_for_wipe(drive: &DriveInfo) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 fn command_record_error_detail(record: &CommandRecord) -> String {
     if !record.stderr.trim().is_empty() {
         record.stderr.trim().to_string()
